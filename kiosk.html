@@ -341,7 +341,7 @@ input,select,textarea{font-size:16px}
    below before uploading, or leave it blank and enter it on first open.
    ===================================================================== */
 window.ILAB_CONFIG = {
-  apiUrl: '',      // e.g. 'https://script.google.com/macros/s/AKfy.../exec'
+  apiUrl: 'https://script.google.com/macros/s/AKfycbwMCtbDmtUe8TJMvVKLCRH8fUvV47ZV21AHfx8K6twlQKlCC--ACoy8Q9jeDsJpWHfL/exec',      // e.g. 'https://script.google.com/macros/s/AKfy.../exec'
   kioskKey: ''     // only if you set a Kiosk key in Admin → Settings
 };
 window.BOOT = { page: 'kiosk', settings: {}, logo: '', webUrl: '' };
@@ -395,8 +395,8 @@ const ICON = {
 };
 const KIND_LABEL = { asset: 'Device / tool', bulk: 'Loose (counted)', consumable: 'Consumable' };
 const STATUS_LABEL = { active: 'Active', maintenance: 'In maintenance', lost: 'Lost', retired: 'Retired' };
-const DUE_OPTS = [['1h', 'In 1 hour'], ['2h', 'In 2 hours'], ['eod', 'End of school day'], ['tomorrow', 'Tomorrow (end of day)'], ['week', 'In 1 week'], ['none', 'No due date'], ['custom', 'Pick date & time…']];
-const DEFAULT_SETTINGS = { labName: 'iLab', dayEnd: '15:00', studentDue: 'eod', teacherDue: 'week', studentMax: 5, blockOverdue: true, idleSec: 120, categories: ['iPad', 'Laptop', 'Electronics', 'Robotics', 'Sensors', 'Tools', 'Cables', 'Consumables', 'Other'] };
+const DUE_OPTS = [['period', 'End of this period'], ['midday', 'Mid-day'], ['eod', 'End of school day'], ['custom', 'Custom date & time']];
+const DEFAULT_SETTINGS = { labName: 'iLab', dayEnd: '15:00', studentDue: 'eod', teacherDue: 'eod', midDay: '12:00', periodEnds: '', studentMax: 5, blockOverdue: true, idleSec: 120, categories: ['iPad', 'Laptop', 'Electronics', 'Robotics', 'Sensors', 'Tools', 'Cables', 'Consumables', 'Other'] };
 
 /* ---------- state ---------- */
 const BOOT = window.BOOT || {};
@@ -438,18 +438,32 @@ function dueBadge(b) {
   const left = b.dueAt - Date.now();
   return `<span class="badge ${left < 3600e3 ? 'warn' : 'grey'}">Due ${left < 864e5 ? fmtT(b.dueAt) : fmtD(b.dueAt)}</span>`;
 }
+function parseHM(s, fb) { const m = /^(\d{1,2}):(\d{2})/.exec(String(s || '').trim()); return m && +m[1] < 24 && +m[2] < 60 ? [+m[1], +m[2]] : fb; }
+function atHM(base, hm) { const d = new Date(base); d.setHours(hm[0], hm[1], 0, 0); return d.getTime(); }
+function nextSchoolDay(base) { const d = new Date(base); do { d.setDate(d.getDate() + 1); } while (d.getDay() === 0 || d.getDay() === 6); return d; }
+function periodEnds() {
+  return String(S.settings.periodEnds || '').split(/[,;\s]+/).map(t => parseHM(t, null)).filter(Boolean)
+    .sort((a, b) => (a[0] * 60 + a[1]) - (b[0] * 60 + b[1]));
+}
 function dueFrom(preset, custom) {
-  const [eh, em] = String(S.settings.dayEnd || '15:00').split(':').map(Number);
-  const at = add => { const x = new Date(); x.setDate(x.getDate() + add); x.setHours(isNaN(eh) ? 15 : eh, isNaN(em) ? 0 : em, 0, 0); return x.getTime(); };
+  const now = Date.now(), today = new Date();
   switch (preset) {
-    case '1h': return Date.now() + 3600e3;
-    case '2h': return Date.now() + 7200e3;
-    case 'eod': { const t = at(0); return t > Date.now() + 15 * 60e3 ? t : at(1); }
-    case 'tomorrow': return at(1);
-    case 'week': return at(7);
+    case 'period': { const t = periodEnds().map(hm => atHM(today, hm)).find(t => t > now + 5 * 60e3); return t || null; }
+    case 'midday': { const t = atHM(today, parseHM(S.settings.midDay, [12, 0])); return t > now + 5 * 60e3 ? t : null; }
+    case 'eod': { const hm = parseHM(S.settings.dayEnd, [15, 0]); const t = atHM(today, hm); return t > now + 10 * 60e3 ? t : atHM(nextSchoolDay(today), hm); }
     case 'custom': { const t = custom ? new Date(custom).getTime() : NaN; return isNaN(t) ? null : t; }
     default: return null;
   }
+}
+// Options for the "Due back" list, each showing the actual time it means.
+function dueOptions() {
+  const sameDay = t => new Date(t).toDateString() === new Date().toDateString();
+  return DUE_OPTS.filter(([v]) => v !== 'period' || periodEnds().length).map(([v, l]) => {
+    if (v === 'custom') return { v, l: l + '…', ok: true };
+    const t = dueFrom(v);
+    if (!t) return { v, l: `${l} (passed)`, ok: false };
+    return { v, l: `${l} — ${fmtT(t)}${sameDay(t) ? '' : ', ' + fmtD(t)}`, ok: true };
+  });
 }
 function brandHTML(sub) {
   const logo = BOOT.logo ? `<div class="logo has-img"><img src="${esc(BOOT.logo)}" alt=""></div>` : `<div class="logo">${ICON.scan.replace('<svg', '<svg style="color:#fff"')}</div>`;
@@ -1000,14 +1014,18 @@ ACT['b-back'] = () => { S.k.step = 'items'; renderKiosk(); };
 function borrowReviewHTML() {
   const k = S.k, p = k.person, now = Date.now();
   const total = k.cart.reduce((a, l) => a + l.qty, 0);
-  const defDue = k.due || (p.role === 'teacher' ? S.settings.teacherDue : S.settings.studentDue) || 'eod';
+  const opts = dueOptions();
+  let defDue = k.due || (p.role === 'teacher' ? S.settings.teacherDue : S.settings.studentDue) || 'eod';
+  if (!opts.some(o => o.v === defDue && o.ok)) defDue = 'eod';
+  const pad2 = n => String(n).padStart(2, '0');
+  const toLocal = t => { const d = new Date(t); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
   return `${stepper(3)}<div class="kgrid">
     <section class="card"><h3 style="margin-bottom:12px">Checkout details</h3>
       <label class="fld"><span>Batch name (used to return everything together)</span><input id="r-label" value="${esc(k.label || `${firstName(p.name)} · ${fmtD(now)} ${fmtT(now)}`)}"></label>
       <label class="fld"><span>Purpose / class (optional)</span><input id="r-purpose" value="${esc(k.purpose || '')}" placeholder="e.g. Grade 8 Robotics, FLL practice"></label>
-      <label class="fld"><span>Due back</span><select id="r-due">${DUE_OPTS.map(([v, l]) => `<option value="${v}" ${v === defDue ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-      <label class="fld ${defDue === 'custom' ? '' : 'hidden'}" id="r-cw"><span>Custom due date</span><input type="datetime-local" id="r-custom"></label>
-      <div class="muted sm" id="r-due-txt"></div></section>
+      <label class="fld"><span>Due back</span><select id="r-due">${opts.map(o => `<option value="${o.v}" ${o.v === defDue ? 'selected' : ''} ${o.ok ? '' : 'disabled'}>${esc(o.l)}</option>`).join('')}</select></label>
+      <label class="fld ${defDue === 'custom' ? '' : 'hidden'}" id="r-cw"><span>Custom due date and time</span><input type="datetime-local" id="r-custom" min="${toLocal(Date.now())}" value="${esc(k.custom || toLocal(dueFrom('eod')))}"></label>
+      <div class="muted sm" id="r-due-txt" aria-live="polite"></div></section>
     <section class="card"><div class="card-h"><h3>${esc(p.name)} <span class="badge ${p.role === 'teacher' ? 'teacher' : 'student'}">${p.role === 'teacher' ? 'Teacher' : 'Student'}</span></h3><span class="pill">${plural(total, 'item')}</span></div>
       <div class="muted sm" style="margin-bottom:6px">Scanning took <b data-timer-from="${k.startAt}"></b></div>
       ${k.cart.map(l => `<div class="line"><div class="thumb">${l.kind === 'asset' ? ICON.device : ICON.box}</div><div class="info"><div class="nm">${esc(l.name)}${l.qty > 1 ? ` × ${l.qty}` : ''}</div><div class="sub mono">${esc(l.code)}</div></div></div>`).join('')}
@@ -1016,15 +1034,17 @@ function borrowReviewHTML() {
 }
 function wireReview() {
   const sel = $('#r-due'), cw = $('#r-cw'), txt = $('#r-due-txt');
-  const upd = () => { cw.classList.toggle('hidden', sel.value !== 'custom'); const d = dueFrom(sel.value, $('#r-custom').value); txt.textContent = d ? 'Due: ' + fmtDT(d) : sel.value === 'none' ? 'No due date' : ''; };
-  sel.onchange = () => { S.k.due = sel.value; upd(); }; $('#r-custom').onchange = upd; upd();
+  const upd = () => { cw.classList.toggle('hidden', sel.value !== 'custom'); const d = dueFrom(sel.value, $('#r-custom').value); txt.textContent = d ? 'Due back: ' + fmtDT(d) : 'Choose a due time.'; };
+  sel.onchange = () => { S.k.due = sel.value; upd(); if (sel.value === 'custom') setTimeout(() => $('#r-custom').focus(), 50); };
+  $('#r-custom').onchange = () => { S.k.custom = $('#r-custom').value; upd(); }; upd();
   $('#r-label').oninput = e => S.k.label = e.target.value;
   $('#r-purpose').oninput = e => S.k.purpose = e.target.value;
 }
 ACT['b-confirm'] = async btn => {
   const k = S.k, p = k.person, now = Date.now();
   const preset = $('#r-due').value, dueAt = dueFrom(preset, $('#r-custom').value);
-  if (preset === 'custom' && !dueAt) return toast('Pick a due date, or choose another option.', 'warn');
+  if (!dueAt) return toast(preset === 'custom' ? 'Pick a due date and time.' : 'That time has passed — choose another option.', 'warn');
+  if (dueAt < now) return toast('The due time is in the past — pick a later time.', 'warn');
   btn.disabled = true; S.busy = true; showBusy('Saving checkout…');
   let r;
   try {
